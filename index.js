@@ -1,96 +1,94 @@
 /**
- * CattleSignal Market Data Service v2.0
- * Railway cron: fetches 15-min delayed futures quotes from Twelve Data API
+ * CattleSignal Market Data Service v2.1
+ * Railway: fetches 15-min delayed futures quotes from Yahoo Finance
  * Serves latest prices as JSON for the Netlify Function to consume
- * 
+ *
  * Markets: GF (Feeder Cattle), LE (Live Cattle), HE (Lean Hogs),
  *          ZC (Corn), ZS (Soybeans), CL (Crude Oil), ZM (Soybean Meal), ZW (Wheat)
- * 
- * Twelve Data Free Tier: 8 API calls/min, 800/day
- * Budget: 8 markets x 4 refreshes/hr x 11 hrs = 352 calls/day (under 800)
+ *
+ * Yahoo Finance: no API key, ~15-min delayed, unofficial endpoint
+ * Disclaimer required on frontend: "Prices delayed, for informational purposes only"
  */
 
 const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
-const TWELVE_DATA_BASE = 'https://api.twelvedata.com';
-
-// Twelve Data commodity symbols -> CattleSignal market codes
+// Yahoo Finance futures symbols (front-month continuous)
 const SYMBOLS = {
-  'GF1':  { name: 'Feeder Cattle', code: 'GF', unit: '¢/lb', multiplier: 500 },
-  'LE1':  { name: 'Live Cattle',   code: 'LE', unit: '¢/lb', multiplier: 400 },
-  'HE1':  { name: 'Lean Hogs',     code: 'HE', unit: '¢/lb', multiplier: 400 },
-  'C_1':  { name: 'Corn',          code: 'ZC', unit: '¢/bu', multiplier: 50 },
-  'S_1':  { name: 'Soybeans',      code: 'ZS', unit: '¢/bu', multiplier: 50 },
-  'CL1':  { name: 'Crude Oil',     code: 'CL', unit: '$/bbl', multiplier: 1000 },
-  'SM1':  { name: 'Soybean Meal',  code: 'ZM', unit: '$/ton', multiplier: 100 },
-  'W_1':  { name: 'Wheat',         code: 'ZW', unit: '¢/bu', multiplier: 50 },
+  'GF=F': { name: 'Feeder Cattle', code: 'GF', unit: '¢/lb', multiplier: 500 },
+  'LE=F': { name: 'Live Cattle',   code: 'LE', unit: '¢/lb', multiplier: 400 },
+  'HE=F': { name: 'Lean Hogs',     code: 'HE', unit: '¢/lb', multiplier: 400 },
+  'ZC=F': { name: 'Corn',          code: 'ZC', unit: '¢/bu', multiplier: 50 },
+  'ZS=F': { name: 'Soybeans',      code: 'ZS', unit: '¢/bu', multiplier: 50 },
+  'CL=F': { name: 'Crude Oil',     code: 'CL', unit: '$/bbl', multiplier: 1000 },
+  'ZM=F': { name: 'Soybean Meal',  code: 'ZM', unit: '$/ton', multiplier: 100 },
+  'ZW=F': { name: 'Wheat',         code: 'ZW', unit: '¢/bu', multiplier: 50 },
 };
 
-// In-memory cache
 let priceCache = {
   lastUpdated: null,
   lastAttempt: null,
   prices: {},
   errors: [],
-  source: 'twelvedata',
+  source: 'yahoo',
 };
 
 /**
- * Fetch quote from Twelve Data /quote endpoint
- * Uses 1 API credit per symbol
+ * Fetch quote from Yahoo Finance v8 chart API
  */
-async function fetchTwelveDataQuote(symbol) {
-  if (!TWELVE_DATA_API_KEY) {
-    throw new Error('TWELVE_DATA_API_KEY not set');
-  }
-
-  const url = `${TWELVE_DATA_BASE}/quote?symbol=${symbol}&apikey=${TWELVE_DATA_API_KEY}`;
+async function fetchYahooQuote(symbol) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
   const res = await fetch(url, {
-    headers: { 'User-Agent': 'CattleSignal/2.0' },
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    },
     signal: AbortSignal.timeout(10000),
   });
 
   if (!res.ok) {
-    throw new Error(`Twelve Data returned ${res.status} for ${symbol}`);
+    throw new Error(`Yahoo returned ${res.status} for ${symbol}`);
   }
 
   const data = await res.json();
+  const result = data?.chart?.result?.[0];
+  if (!result) throw new Error(`No chart data for ${symbol}`);
 
-  if (data.status === 'error' || data.code) {
-    throw new Error(data.message || `API error for ${symbol}: code ${data.code}`);
-  }
+  const meta = result.meta;
+  const quote = result.indicators?.quote?.[0];
+  const closes = quote?.close?.filter(v => v !== null) || [];
+  const highs = quote?.high?.filter(v => v !== null) || [];
+  const lows = quote?.low?.filter(v => v !== null) || [];
+  const opens = quote?.open?.filter(v => v !== null) || [];
+  const volumes = quote?.volume?.filter(v => v !== null) || [];
+
+  const price = meta.regularMarketPrice;
+  const prevClose = meta.chartPreviousClose || meta.previousClose;
 
   return {
-    price: parseFloat(data.close) || parseFloat(data.previous_close),
-    previousClose: parseFloat(data.previous_close) || null,
-    open: parseFloat(data.open) || null,
-    high: parseFloat(data.high) || null,
-    low: parseFloat(data.low) || null,
-    volume: parseInt(data.volume) || null,
-    change: parseFloat(data.change) || 0,
-    changePct: parseFloat(data.percent_change) || 0,
-    fiftyTwoWeekHigh: parseFloat(data.fifty_two_week?.high) || null,
-    fiftyTwoWeekLow: parseFloat(data.fifty_two_week?.low) || null,
-    datetime: data.datetime || null,
-    exchange: data.exchange || 'CME',
+    price,
+    previousClose: prevClose,
+    open: opens.length > 0 ? opens[0] : null,
+    high: highs.length > 0 ? Math.max(...highs) : null,
+    low: lows.length > 0 ? Math.min(...lows) : null,
+    volume: volumes.length > 0 ? volumes.reduce((a, b) => a + b, 0) : null,
+    change: price - prevClose,
+    changePct: (((price - prevClose) / prevClose) * 100).toFixed(2),
+    marketState: meta.currentTradingPeriod?.regular ? 'regular' : 'closed',
   };
 }
 
 /**
  * Refresh all market prices
- * Sequential with 1.5s delay to respect 8 calls/min rate limit
  */
 async function refreshPrices() {
-  console.log(`[${new Date().toISOString()}] Refreshing prices via Twelve Data...`);
+  console.log(`[${new Date().toISOString()}] Refreshing prices via Yahoo Finance...`);
   const errors = [];
   const prices = {};
 
   for (const [symbol, info] of Object.entries(SYMBOLS)) {
     try {
-      const quote = await fetchTwelveDataQuote(symbol);
+      const quote = await fetchYahooQuote(symbol);
       prices[info.code] = {
         ...info,
         ...quote,
@@ -105,8 +103,8 @@ async function refreshPrices() {
         prices[info.code] = { ...priceCache.prices[info.code], stale: true };
       }
     }
-    // 1.5s between requests = 8 symbols in ~12s, well under 8/min limit
-    await new Promise(r => setTimeout(r, 1500));
+    // 500ms between requests to avoid throttling
+    await new Promise(r => setTimeout(r, 500));
   }
 
   priceCache = {
@@ -116,7 +114,7 @@ async function refreshPrices() {
     errors,
     marketsCount: Object.keys(prices).length,
     errorsCount: errors.length,
-    source: 'twelvedata',
+    source: 'yahoo',
   };
 
   console.log(`[${new Date().toISOString()}] Done: ${Object.keys(prices).length} markets, ${errors.length} errors`);
@@ -131,7 +129,7 @@ function generateSystemPromptSnippet() {
     return '⚠️ No market data available. Use recent knowledge for price context.';
   }
 
-  const lines = ['═══ LIVE MARKET DATA (15-min delayed, Twelve Data) ═══'];
+  const lines = ['═══ MARKET DATA (delayed ~15 min) ═══'];
   lines.push(`Last updated: ${priceCache.lastUpdated}`);
   lines.push('');
 
@@ -139,14 +137,14 @@ function generateSystemPromptSnippet() {
     if (!data.price) continue;
     const dir = data.change >= 0 ? '▲' : '▼';
     const staleTag = data.stale ? ' [STALE]' : '';
-    lines.push(`${data.name} (${code}): ${data.price.toFixed(2)} ${data.unit} ${dir} ${Math.abs(data.change).toFixed(2)} (${Number(data.changePct).toFixed(2)}%)${staleTag}`);
+    lines.push(`${data.name} (${code}): ${data.price.toFixed(2)} ${data.unit} ${dir} ${Math.abs(data.change).toFixed(2)} (${data.changePct}%)${staleTag}`);
     if (data.high && data.low) {
       lines.push(`  Range: ${data.low.toFixed(2)}-${data.high.toFixed(2)} | Vol: ${(data.volume || 0).toLocaleString()}`);
     }
   }
 
   lines.push('');
-  lines.push('Use these prices for entry/target/stop recommendations. 15-min delayed CME quotes.');
+  lines.push('Use these prices for entry/target/stop recommendations. Prices are delayed ~15 min.');
   return lines.join('\n');
 }
 
@@ -155,13 +153,12 @@ function generateSystemPromptSnippet() {
 app.get('/', (req, res) => {
   res.json({
     service: 'CattleSignal Market Data',
-    version: '2.0.0',
-    source: 'twelvedata',
+    version: '2.1.0',
+    source: 'yahoo',
     status: priceCache.lastUpdated ? 'ok' : 'no_data',
     lastUpdated: priceCache.lastUpdated,
     marketsLoaded: Object.keys(priceCache.prices).length,
     errors: priceCache.errorsCount || 0,
-    apiKeyConfigured: !!TWELVE_DATA_API_KEY,
   });
 });
 
@@ -219,14 +216,10 @@ setInterval(async () => {
   }
 }, FIFTEEN_MINUTES);
 
-// Initial fetch
-if (TWELVE_DATA_API_KEY) {
-  refreshPrices().catch(err => console.error('Initial fetch failed:', err.message));
-} else {
-  console.warn('⚠️ TWELVE_DATA_API_KEY not set. Get a free key at https://twelvedata.com/');
-}
+// Initial fetch on startup (always, even if market closed — shows last known prices)
+refreshPrices().catch(err => console.error('Initial fetch failed:', err.message));
 
 app.listen(PORT, () => {
-  console.log(`CattleSignal Market Data v2.0 on port ${PORT}`);
-  console.log(`Source: Twelve Data | Key: ${TWELVE_DATA_API_KEY ? 'configured' : 'MISSING'}`);
+  console.log(`CattleSignal Market Data v2.1 on port ${PORT}`);
+  console.log(`Source: Yahoo Finance (no API key required)`);
 });
