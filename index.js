@@ -200,7 +200,7 @@ app.post('/refresh', async (req, res) => {
 // ─── MARKET SCORECARD (AI-powered, cached, on-demand) ───
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const SCORE_MODEL = 'claude-haiku-4-5-20251001';
+const SCORE_MODEL = 'claude-sonnet-4-20250514';
 const SCORE_MAX_AGE = 15 * 60 * 1000; // 15 min cache
 
 let scoreCache = {
@@ -307,9 +307,7 @@ async function generateScores() {
 
     const prompt = buildScoringPrompt(priceCache.prices, cotData);
 
-    // Try Haiku first, fall back to Sonnet if Haiku fails
-    let model = SCORE_MODEL;
-    let res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -317,32 +315,12 @@ async function generateScores() {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model,
+        model: SCORE_MODEL,
         max_tokens: 2000,
         messages: [{ role: 'user', content: prompt }],
       }),
       signal: AbortSignal.timeout(30000),
     });
-
-    // Fallback to Sonnet if Haiku fails
-    if (!res.ok && model !== 'claude-sonnet-4-20250514') {
-      console.warn(`  Haiku failed (${res.status}), falling back to Sonnet`);
-      model = 'claude-sonnet-4-20250514';
-      res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: 2000,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-        signal: AbortSignal.timeout(30000),
-      });
-    }
 
     if (!res.ok) {
       const err = await res.text();
