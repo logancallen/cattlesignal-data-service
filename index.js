@@ -200,68 +200,116 @@ app.post('/refresh', async (req, res) => {
 // ─── MARKET SCORECARD (AI-powered, cached, on-demand) ───
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const SCORE_MODEL = 'claude-sonnet-4-20250514';
+const SCORE_MODEL = 'claude-haiku-4-5-20251001';
 const SCORE_MAX_AGE = 15 * 60 * 1000; // 15 min cache
 
 let scoreCache = {
   lastUpdated: null,
   scores: null,
   refreshing: false,
+  lastError: null,
 };
 
 let scoreHistory = []; // Keep last 48 entries (~12 hours at 15-min intervals)
 
-function buildScoringPrompt(prices) {
+// Try to load COT data from the prompt-snippet (which includes COT if available)
+async function fetchCOTContext() {
+  try {
+    const res = await fetch('https://cattlesignal-data-service-production.up.railway.app/prompt-snippet', {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    // Check if COT data is present in the snippet
+    if (text.includes('COT') || text.includes('Managed Money')) return text;
+    return null;
+  } catch { return null; }
+}
+
+function buildScoringPrompt(prices, cotData) {
+  const today = new Date();
+  const dateStr = today.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'America/Chicago' });
+  const month = today.toLocaleString('en-US', { month: 'long', timeZone: 'America/Chicago' });
+
   const priceLines = Object.entries(prices).map(([code, d]) => {
     if (!d.price) return null;
     const dir = d.change >= 0 ? '+' : '';
     return `${d.name} (${code}): ${d.price.toFixed(2)} ${d.unit} ${dir}${d.change.toFixed(2)} (${d.changePct}%) | Range: ${(d.low||0).toFixed(2)}-${(d.high||0).toFixed(2)} | Vol: ${(d.volume||0).toLocaleString()}`;
   }).filter(Boolean).join('\n');
 
-  return `You are a cattle and commodity market scoring engine. Analyze current market data and produce a JSON scorecard.
+  const cotSection = cotData
+    ? `\nCOT POSITIONING DATA (from CFTC weekly report):\n${cotData}\nCOT_AVAILABLE: true`
+    : `\nCOT POSITIONING DATA: NOT AVAILABLE. You do not have current COT data. Score the positioning factor as 50 (neutral) and set positioning confidence to LOW.\nCOT_AVAILABLE: false`;
 
-CURRENT MARKET DATA:
+  const dataSources = [
+    'Price data: YES (15-min delayed Yahoo Finance)',
+    `COT data: ${cotData ? 'YES' : 'NO — unavailable, do not guess'}`,
+    'USDA reports: NO — not available in this request, do not guess specific numbers',
+    'Slaughter data: NO — not available, do not guess',
+    'Export data: NO — not available, do not guess',
+  ].join('\n');
+
+  return `You are a cattle and commodity market scoring engine. Today is ${dateStr}. The current month is ${month}. It is ${month.includes('Mar') || month.includes('Apr') || month.includes('May') ? 'SPRING' : month.includes('Jun') || month.includes('Jul') || month.includes('Aug') ? 'SUMMER' : month.includes('Sep') || month.includes('Oct') || month.includes('Nov') ? 'FALL' : 'WINTER'} in the Northern Hemisphere.
+
+AVAILABLE DATA SOURCES:
+${dataSources}
+
+CURRENT MARKET DATA (15-min delayed):
 ${priceLines}
+${cotSection}
+
+CRITICAL RULES:
+1. Only cite data you actually have above. Do NOT fabricate USDA numbers, slaughter rates, export figures, or COT positions.
+2. If you lack data for a factor, score it 50 (neutral) and note "Data unavailable" in the note field.
+3. Seasonal patterns must reflect the ACTUAL current month (${month}), not a hallucinated season.
+4. Confidence score must reflect data completeness honestly:
+   - All 5 data sources available: 80-95
+   - Price + COT only: 55-70
+   - Price only (current state): 35-50
+   - Missing or stale prices: 15-30
+5. Factor notes must be under 15 words and must NOT cite specific numbers you don't have.
 
 For each of these 8 markets, produce a composite outlook score from 0-100:
 0-15 = Strongly Bearish, 16-30 = Bearish, 31-45 = Slightly Bearish, 46-55 = Neutral, 56-70 = Slightly Bullish, 71-85 = Bullish, 86-100 = Strongly Bullish
 
-Score each market on these 5 factors (each 0-100):
-1. supply: Supply fundamentals (inventory levels, production, imports/exports)
-2. demand: Demand strength (domestic consumption, export pace, seasonal patterns)
-3. positioning: COT/managed money positioning and sentiment
-4. macro: Macro environment (interest rates, energy costs, trade policy, USD)
-5. seasonal: Seasonal pattern strength for current time of year
+Score each market on 5 factors (each 0-100):
+1. supply: Supply fundamentals based on known conditions
+2. demand: Demand strength based on known conditions
+3. positioning: COT/managed money (use 50 if COT unavailable)
+4. macro: Macro environment (interest rates, energy costs, trade policy)
+5. seasonal: Seasonal pattern for ${month} specifically
 
-The composite score is the weighted average: supply 25%, demand 20%, positioning 15%, macro 15%, seasonal 15%, plus a 10% discretionary adjustment based on unique current factors.
+Composite = supply 25% + demand 20% + positioning 15% + macro 15% + seasonal 15% + 10% discretionary.
 
-Also produce a confidence score (0-100) based on:
-- Data freshness (are prices current?)
-- Factor agreement (do sub-factors point same direction?)
-- Data completeness (do we have enough information?)
+CRITICAL: Respond with ONLY valid JSON, no markdown, no backticks, no preamble. Exact structure:
 
-For each market, provide a one-sentence summary explaining the score.
-For each factor, provide a brief explanation (under 15 words).
-
-CRITICAL: Respond with ONLY valid JSON, no markdown, no backticks, no preamble. Use this exact structure:
-
-{"scores":[{"code":"GF","name":"Feeder Cattle","price":0,"change":0,"changePct":0,"composite":0,"confidence":0,"signal":"Bullish","summary":"One sentence.","factors":{"supply":{"score":0,"note":"brief"},"demand":{"score":0,"note":"brief"},"positioning":{"score":0,"note":"brief"},"macro":{"score":0,"note":"brief"},"seasonal":{"score":0,"note":"brief"}}}],"generatedAt":"ISO timestamp","marketStatus":"open or closed"}`;
+{"scores":[{"code":"GF","name":"Feeder Cattle","price":0,"change":0,"changePct":0,"composite":0,"confidence":0,"signal":"Bullish","summary":"One sentence.","factors":{"supply":{"score":0,"note":"brief"},"demand":{"score":0,"note":"brief"},"positioning":{"score":0,"note":"brief"},"macro":{"score":0,"note":"brief"},"seasonal":{"score":0,"note":"brief"}}}],"generatedAt":"ISO timestamp","marketStatus":"open or closed","dataSources":{"prices":true,"cot":${cotData ? 'true' : 'false'},"usda":false,"slaughter":false,"exports":false}}`;
 }
 
 async function generateScores() {
   if (!ANTHROPIC_API_KEY) {
     console.warn('No ANTHROPIC_API_KEY — cannot generate scores');
+    scoreCache.lastError = 'No API key configured';
     return null;
   }
   if (Object.keys(priceCache.prices).length === 0) {
     console.warn('No price data — cannot generate scores');
+    scoreCache.lastError = 'No price data available';
     return null;
   }
 
   console.log(`[${new Date().toISOString()}] Generating market scores...`);
 
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    // Try to get COT data
+    const cotData = await fetchCOTContext();
+    console.log(`  COT data: ${cotData ? 'available' : 'unavailable'}`);
+
+    const prompt = buildScoringPrompt(priceCache.prices, cotData);
+
+    // Try Haiku first, fall back to Sonnet if Haiku fails
+    let model = SCORE_MODEL;
+    let res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -269,15 +317,32 @@ async function generateScores() {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: SCORE_MODEL,
+        model,
         max_tokens: 2000,
-        messages: [{
-          role: 'user',
-          content: buildScoringPrompt(priceCache.prices),
-        }],
+        messages: [{ role: 'user', content: prompt }],
       }),
       signal: AbortSignal.timeout(30000),
     });
+
+    // Fallback to Sonnet if Haiku fails
+    if (!res.ok && model !== 'claude-sonnet-4-20250514') {
+      console.warn(`  Haiku failed (${res.status}), falling back to Sonnet`);
+      model = 'claude-sonnet-4-20250514';
+      res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 2000,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+    }
 
     if (!res.ok) {
       const err = await res.text();
