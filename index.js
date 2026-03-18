@@ -200,7 +200,7 @@ app.post('/refresh', async (req, res) => {
 // ─── MARKET SCORECARD (AI-powered, cached, on-demand) ───
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const SCORE_MODEL = 'claude-haiku-4-5-20251001';
+const SCORE_MODEL = 'claude-sonnet-4-20250514';
 const SCORE_MAX_AGE = 15 * 60 * 1000; // 15 min cache
 
 let scoreCache = {
@@ -345,6 +345,7 @@ async function generateScores() {
 
   } catch (err) {
     console.error('Score generation failed:', err.message);
+    scoreCache.lastError = err.message;
     return null;
   }
 }
@@ -386,15 +387,18 @@ app.get('/scores', async (req, res) => {
     if (scores) {
       scoreCache.scores = scores;
       scoreCache.lastUpdated = new Date().toISOString();
+      scoreCache.lastError = null;
     }
     scoreCache.refreshing = false;
     return res.json({
       ...(scoreCache.scores || { scores: null }),
       cached: false,
       history: scoreHistory.slice(-12),
+      lastError: scoreCache.lastError || null,
     });
   } catch (err) {
     scoreCache.refreshing = false;
+    scoreCache.lastError = err.message;
     return res.status(500).json({ error: err.message });
   }
 });
