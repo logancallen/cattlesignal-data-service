@@ -212,16 +212,15 @@ let scoreCache = {
 
 let scoreHistory = []; // Keep last 48 entries (~12 hours at 15-min intervals)
 
-// Try to load COT data from the prompt-snippet (which includes COT if available)
+// Fetch COT data from the GitHub repo where the Action commits it
 async function fetchCOTContext() {
   try {
-    const res = await fetch('https://cattlesignal-data-service-production.up.railway.app/prompt-snippet', {
-      signal: AbortSignal.timeout(3000),
+    const res = await fetch('https://raw.githubusercontent.com/logancallen/cattlesignal/main/data/cot-latest.json', {
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return null;
-    const text = await res.text();
-    // Check if COT data is present in the snippet
-    if (text.includes('COT') || text.includes('Managed Money')) return text;
+    const data = await res.json();
+    if (data.promptSnippet) return data.promptSnippet;
     return null;
   } catch { return null; }
 }
